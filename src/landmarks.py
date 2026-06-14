@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import math
 import time
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 import cv2
@@ -17,6 +19,11 @@ MAX_NUM_FACES = 1
 REFINE_LANDMARKS = True
 MIN_DETECTION_CONFIDENCE = 0.5
 MIN_TRACKING_CONFIDENCE = 0.5
+FACE_LANDMARKER_MODEL_PATH = Path("models/face_landmarker.task")
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/latest/face_landmarker.task"
+)
 
 # Drowsiness thresholds
 EAR_THRESHOLD = 0.22
@@ -115,12 +122,22 @@ def mouth_aspect_ratio(points: np.ndarray) -> float:
 
 
 def normalized_to_pixel_landmarks(face_landmarks: object, width: int, height: int) -> np.ndarray:
+    landmarks = face_landmarks.landmark if hasattr(face_landmarks, "landmark") else face_landmarks
     points = []
-    for landmark in face_landmarks.landmark:
+    for landmark in landmarks:
         x = min(max(landmark.x * width, 0.0), width - 1.0)
         y = min(max(landmark.y * height, 0.0), height - 1.0)
         points.append((x, y))
     return np.asarray(points, dtype=np.float64)
+
+
+def ensure_face_landmarker_model(path: Path = FACE_LANDMARKER_MODEL_PATH) -> Path:
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading MediaPipe Face Landmarker model to {path}...")
+    urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, path)
+    return path
 
 
 def face_bbox_from_landmarks(
@@ -232,29 +249,68 @@ class FaceGeometryTracker:
 
         import mediapipe as mp
 
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=MAX_NUM_FACES,
-            refine_landmarks=REFINE_LANDMARKS,
-            min_detection_confidence=MIN_DETECTION_CONFIDENCE,
-            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
-        )
+        self.mp = mp
+        self.backend = "solutions" if hasattr(mp, "solutions") else "tasks"
+        self.face_mesh = None
+        self.face_landmarker = None
+        self._last_video_timestamp_ms = -1
+
+        if self.backend == "solutions":
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=MAX_NUM_FACES,
+                refine_landmarks=REFINE_LANDMARKS,
+                min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+                min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+            )
+        else:
+            from mediapipe.tasks.python import vision
+            from mediapipe.tasks.python.core.base_options import BaseOptions
+            from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+                VisionTaskRunningMode,
+            )
+
+            model_path = ensure_face_landmarker_model()
+            options = vision.FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(model_path)),
+                running_mode=VisionTaskRunningMode.VIDEO,
+                num_faces=MAX_NUM_FACES,
+                min_face_detection_confidence=MIN_DETECTION_CONFIDENCE,
+                min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+            )
+            self.face_landmarker = vision.FaceLandmarker.create_from_options(options)
 
     def close(self) -> None:
-        self.face_mesh.close()
+        if self.face_mesh is not None:
+            self.face_mesh.close()
+        if self.face_landmarker is not None:
+            self.face_landmarker.close()
 
     def process_frame(self, frame_bgr: np.ndarray, timestamp: float | None = None) -> FaceGeometryResult | None:
         timestamp = time.time() if timestamp is None else timestamp
         height, width = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
-        results = self.face_mesh.process(rgb)
-        if not results.multi_face_landmarks:
-            self._expire_histories(timestamp)
-            return None
+        if self.backend == "solutions":
+            results = self.face_mesh.process(rgb)
+            if not results.multi_face_landmarks:
+                self._expire_histories(timestamp)
+                return None
+            raw_landmarks = results.multi_face_landmarks[0]
+        else:
+            timestamp_ms = max(int(timestamp * 1000), self._last_video_timestamp_ms + 1)
+            self._last_video_timestamp_ms = timestamp_ms
+            mp_image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb)
+            results = self.face_landmarker.detect_for_video(mp_image, timestamp_ms)
+            if not results.face_landmarks:
+                self._expire_histories(timestamp)
+                return None
+            raw_landmarks = results.face_landmarks[0]
 
-        landmarks_px = normalized_to_pixel_landmarks(results.multi_face_landmarks[0], width, height)
+        landmarks_px = normalized_to_pixel_landmarks(raw_landmarks, width, height)
         left_ear = eye_aspect_ratio(landmarks_px, LEFT_EYE_EAR)
         right_ear = eye_aspect_ratio(landmarks_px, RIGHT_EYE_EAR)
         ear = (left_ear + right_ear) / 2.0
