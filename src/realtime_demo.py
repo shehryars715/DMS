@@ -11,12 +11,34 @@ import cv2
 try:
     from .ddd_model import LoadedDrowsinessModel, load_drowsiness_model, predict_drowsiness_probability
     from .fusion import DriverState, FusionConfig, FusionScores, FusionStateMachine, SignalSnapshot, TransitionLogger
-    from .landmarks import FaceGeometryTracker, crop_bbox, draw_face_geometry, draw_text_block
+    from .landmarks import (
+        EAR_THRESHOLD,
+        LOOK_AWAY_MIN_SECONDS,
+        MAR_THRESHOLD,
+        PITCH_LOOK_AWAY_THRESHOLD_DEG,
+        YAWN_MIN_SECONDS,
+        YAW_LOOK_AWAY_THRESHOLD_DEG,
+        FaceGeometryTracker,
+        crop_bbox,
+        draw_face_geometry,
+        draw_text_block,
+    )
     from .phone_detector import PhoneDetectionResult, PhoneDetector, draw_phone_detections
 except ImportError:  # pragma: no cover - allows `python src/realtime_demo.py`
     from ddd_model import LoadedDrowsinessModel, load_drowsiness_model, predict_drowsiness_probability
     from fusion import DriverState, FusionConfig, FusionScores, FusionStateMachine, SignalSnapshot, TransitionLogger
-    from landmarks import FaceGeometryTracker, crop_bbox, draw_face_geometry, draw_text_block
+    from landmarks import (
+        EAR_THRESHOLD,
+        LOOK_AWAY_MIN_SECONDS,
+        MAR_THRESHOLD,
+        PITCH_LOOK_AWAY_THRESHOLD_DEG,
+        YAWN_MIN_SECONDS,
+        YAW_LOOK_AWAY_THRESHOLD_DEG,
+        FaceGeometryTracker,
+        crop_bbox,
+        draw_face_geometry,
+        draw_text_block,
+    )
     from phone_detector import PhoneDetectionResult, PhoneDetector, draw_phone_detections
 
 
@@ -124,6 +146,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-device", type=str, default=None)
     parser.add_argument("--log", type=Path, default=Path("logs/state_transitions.csv"))
     parser.add_argument("--hide-landmarks", action="store_true", help="Only show key landmarks and metrics.")
+    parser.add_argument("--ear-threshold", type=float, default=EAR_THRESHOLD)
+    parser.add_argument("--mar-threshold", type=float, default=MAR_THRESHOLD)
+    parser.add_argument("--yawn-seconds", type=float, default=YAWN_MIN_SECONDS)
+    parser.add_argument("--yaw-threshold", type=float, default=YAW_LOOK_AWAY_THRESHOLD_DEG)
+    parser.add_argument("--pitch-threshold", type=float, default=PITCH_LOOK_AWAY_THRESHOLD_DEG)
+    parser.add_argument("--look-away-seconds", type=float, default=LOOK_AWAY_MIN_SECONDS)
     return parser.parse_args()
 
 
@@ -131,7 +159,14 @@ def main() -> None:
     args = parse_args()
     cnn_model = load_optional_cnn(args.checkpoint, disabled=args.no_cnn)
     phone_detector = load_optional_phone_detector(args)
-    geometry = FaceGeometryTracker()
+    geometry = FaceGeometryTracker(
+        ear_threshold=args.ear_threshold,
+        mar_threshold=args.mar_threshold,
+        yawn_min_seconds=args.yawn_seconds,
+        yaw_look_away_threshold_deg=args.yaw_threshold,
+        pitch_look_away_threshold_deg=args.pitch_threshold,
+        look_away_min_seconds=args.look_away_seconds,
+    )
     fusion = FusionStateMachine(FusionConfig())
     transition_logger = TransitionLogger(args.log)
 

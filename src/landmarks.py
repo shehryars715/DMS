@@ -29,13 +29,14 @@ FACE_LANDMARKER_MODEL_URL = (
 EAR_THRESHOLD = 0.22
 PERCLOS_WINDOW_SECONDS = 60.0
 PERCLOS_DROWSY_THRESHOLD = 0.35
-MAR_THRESHOLD = 0.65
-YAWN_MIN_SECONDS = 1.5
+MAR_THRESHOLD = 0.35
+YAWN_MIN_SECONDS = 0.6
 
 # Distraction thresholds
 YAW_LOOK_AWAY_THRESHOLD_DEG = 25.0
 PITCH_LOOK_AWAY_THRESHOLD_DEG = 20.0
 LOOK_AWAY_MIN_SECONDS = 1.0
+HEAD_POSE_CALIBRATION_FRAMES = 30
 
 # Drawing settings
 LANDMARK_POINT_RADIUS = 1
@@ -246,6 +247,8 @@ class FaceGeometryTracker:
         self.closed_eye_history: deque[tuple[float, bool]] = deque()
         self.yawn_started_at: float | None = None
         self.look_away_started_at: float | None = None
+        self.head_pose_samples: list[np.ndarray] = []
+        self.head_pose_baseline: np.ndarray | None = None
 
         import mediapipe as mp
 
@@ -315,7 +318,8 @@ class FaceGeometryTracker:
         right_ear = eye_aspect_ratio(landmarks_px, RIGHT_EYE_EAR)
         ear = (left_ear + right_ear) / 2.0
         mar = mouth_aspect_ratio(landmarks_px)
-        head_pose = estimate_head_pose(landmarks_px, (height, width))
+        raw_head_pose = estimate_head_pose(landmarks_px, (height, width))
+        head_pose = self._apply_head_pose_calibration(raw_head_pose)
 
         blink = ear < self.ear_threshold
         self.closed_eye_history.append((timestamp, blink))
@@ -371,6 +375,28 @@ class FaceGeometryTracker:
             return 0.0
         closed = sum(1 for _, is_closed in self.closed_eye_history if is_closed)
         return closed / len(self.closed_eye_history)
+
+    def _apply_head_pose_calibration(self, head_pose: HeadPose | None) -> HeadPose | None:
+        if head_pose is None:
+            return None
+
+        raw_angles = np.array([head_pose.pitch, head_pose.yaw, head_pose.roll], dtype=np.float64)
+        if self.head_pose_baseline is None:
+            self.head_pose_samples.append(raw_angles)
+            current_baseline = np.median(np.asarray(self.head_pose_samples), axis=0)
+            if len(self.head_pose_samples) >= HEAD_POSE_CALIBRATION_FRAMES:
+                self.head_pose_baseline = current_baseline
+        else:
+            current_baseline = self.head_pose_baseline
+
+        adjusted = raw_angles - current_baseline
+        return HeadPose(
+            pitch=float(adjusted[0]),
+            yaw=float(adjusted[1]),
+            roll=float(adjusted[2]),
+            rotation_vector=head_pose.rotation_vector,
+            translation_vector=head_pose.translation_vector,
+        )
 
 
 def draw_face_geometry(

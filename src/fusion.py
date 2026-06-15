@@ -157,8 +157,11 @@ class FusionStateMachine:
 
         if (
             drowsy >= cfg.critical_threshold
-            or distracted >= cfg.critical_threshold
             or (drowsy >= cfg.drowsy_high_threshold and distracted >= cfg.distraction_medium_threshold)
+            or (
+                scores.phone_distraction > 0.0
+                and scores.head_distraction >= cfg.distraction_high_threshold
+            )
         ):
             return DriverState.CRITICAL
 

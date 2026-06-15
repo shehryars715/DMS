@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -52,6 +53,7 @@ class TrainConfig:
     val_size: float
     test_size: float
     threshold: float
+    init_checkpoint: Path | None
 
 
 def normalize_label_name(value: str) -> str:
@@ -286,6 +288,20 @@ def train(config: TrainConfig) -> dict[str, object]:
 
     config.output.parent.mkdir(parents=True, exist_ok=True)
     best_val_f1 = -1.0
+    if config.init_checkpoint is not None:
+        if not config.init_checkpoint.exists():
+            raise FileNotFoundError(f"Initial checkpoint not found: {config.init_checkpoint}")
+        checkpoint = torch.load(config.init_checkpoint, map_location=device)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        model.load_state_dict(state_dict)
+        best_val_f1 = float(checkpoint.get("best_val_f1", -1.0))
+        if config.init_checkpoint.resolve() != config.output.resolve():
+            shutil.copy2(config.init_checkpoint, config.output)
+        print(
+            f"Warm-started from {config.init_checkpoint} "
+            f"(starting best_val_f1={best_val_f1:.4f})"
+        )
+
     history: list[dict[str, float]] = []
 
     for epoch in range(1, config.epochs + 1):
@@ -362,6 +378,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--val-size", type=float, default=0.15)
     parser.add_argument("--test-size", type=float, default=0.15)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional checkpoint to warm-start from before training.",
+    )
     args = parser.parse_args()
     return TrainConfig(**vars(args))
 
