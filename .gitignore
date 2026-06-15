@@ -9,9 +9,6 @@ data/eval/
 models/
 logs/
 reports/
-DMS_HPC_PACKAGE/
-DMS_HPC_PACKAGE.zip
-DMS_HPC_PACKAGE.tar.gz
 
 *.mp4
 *.avi
