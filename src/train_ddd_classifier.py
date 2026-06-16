@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import random
 import shutil
 from dataclasses import asdict, dataclass
@@ -54,6 +55,8 @@ class TrainConfig:
     test_size: float
     threshold: float
     init_checkpoint: Path | None
+    split_mode: str
+    group_split_trials: int
 
 
 def normalize_label_name(value: str) -> str:
@@ -109,6 +112,18 @@ def discover_images(data_dir: Path) -> tuple[list[Path], list[int]]:
     return paths, labels
 
 
+def group_id_from_path(path: Path) -> str:
+    """Infer a coarse sequence/session group from a DDD filename.
+
+    DDD files are named in prefix runs such as A0001, B0123, ZA0456. A random
+    image-level split leaks near-duplicate frames across train/val/test, so the
+    grouped split keeps each prefix entirely in one split.
+    """
+
+    match = re.match(r"([A-Za-z]+)", path.stem)
+    return match.group(1).lower() if match else path.stem.lower()
+
+
 def stratified_split(
     paths: list[Path],
     labels: list[int],
@@ -136,6 +151,88 @@ def stratified_split(
         random_state=seed,
     )
     return train_paths, train_labels, val_paths, val_labels, test_paths, test_labels
+
+
+def grouped_split(
+    paths: list[Path],
+    labels: list[int],
+    val_size: float,
+    test_size: float,
+    seed: int,
+    trials: int = 5000,
+) -> tuple[list[Path], list[int], list[Path], list[int], list[Path], list[int], dict[str, list[str]]]:
+    train_size = 1.0 - val_size - test_size
+    if train_size <= 0:
+        raise ValueError("val_size + test_size must be less than 1.0")
+
+    group_stats: dict[str, np.ndarray] = {}
+    for path, label in zip(paths, labels):
+        group = group_id_from_path(path)
+        if group not in group_stats:
+            group_stats[group] = np.zeros(2, dtype=np.int64)
+        group_stats[group][label] += 1
+
+    groups = sorted(group_stats)
+    if len(groups) < 3:
+        raise RuntimeError("Grouped split needs at least three filename groups.")
+
+    totals = np.array([labels.count(0), labels.count(1)], dtype=np.float64)
+    total_count = float(totals.sum())
+    overall_positive_rate = totals[1] / total_count
+    target_fracs = np.array([train_size, val_size, test_size], dtype=np.float64)
+    rng = np.random.default_rng(seed)
+
+    best_assignment: dict[str, int] | None = None
+    best_cost = float("inf")
+    assignment_probs = target_fracs / target_fracs.sum()
+
+    for _ in range(max(1, trials)):
+        assignment = {group: int(rng.choice(3, p=assignment_probs)) for group in groups}
+        split_counts = np.zeros((3, 2), dtype=np.float64)
+        split_group_counts = np.zeros(3, dtype=np.int64)
+        for group, split_id in assignment.items():
+            split_counts[split_id] += group_stats[group]
+            split_group_counts[split_id] += 1
+
+        if np.any(split_group_counts == 0) or np.any(split_counts == 0):
+            continue
+
+        split_totals = split_counts.sum(axis=1)
+        split_fracs = split_totals / total_count
+        positive_rates = split_counts[:, 1] / split_totals
+        size_cost = float(np.sum((split_fracs - target_fracs) ** 2))
+        class_cost = float(np.sum((positive_rates - overall_positive_rate) ** 2))
+        cost = size_cost + 0.25 * class_cost
+
+        if cost < best_cost:
+            best_cost = cost
+            best_assignment = assignment
+
+    if best_assignment is None:
+        raise RuntimeError("Could not create a valid grouped split.")
+
+    split_paths: list[list[Path]] = [[], [], []]
+    split_labels: list[list[int]] = [[], [], []]
+    for path, label in zip(paths, labels):
+        split_id = best_assignment[group_id_from_path(path)]
+        split_paths[split_id].append(path)
+        split_labels[split_id].append(label)
+
+    split_groups = {
+        "train": sorted(group for group, split_id in best_assignment.items() if split_id == 0),
+        "val": sorted(group for group, split_id in best_assignment.items() if split_id == 1),
+        "test": sorted(group for group, split_id in best_assignment.items() if split_id == 2),
+    }
+    print(f"Grouped split by filename prefix: {split_groups}")
+    return (
+        split_paths[0],
+        split_labels[0],
+        split_paths[1],
+        split_labels[1],
+        split_paths[2],
+        split_labels[2],
+        split_groups,
+    )
 
 
 class DDDDataset(Dataset):
@@ -274,8 +371,20 @@ def train(config: TrainConfig) -> dict[str, object]:
     torch.manual_seed(config.seed)
 
     paths, labels = discover_images(config.data_dir)
-    split = stratified_split(paths, labels, config.val_size, config.test_size, config.seed)
-    train_paths, train_labels, val_paths, val_labels, test_paths, test_labels = split
+    split_groups: dict[str, list[str]] | None = None
+    if config.split_mode == "group":
+        split = grouped_split(
+            paths,
+            labels,
+            config.val_size,
+            config.test_size,
+            config.seed,
+            config.group_split_trials,
+        )
+        train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, split_groups = split
+    else:
+        split = stratified_split(paths, labels, config.val_size, config.test_size, config.seed)
+        train_paths, train_labels, val_paths, val_labels, test_paths, test_labels = split
 
     train_loader = make_loader(train_paths, train_labels, config, augment=True, shuffle=True)
     val_loader = make_loader(val_paths, val_labels, config, augment=False, shuffle=False)
@@ -355,6 +464,8 @@ def train(config: TrainConfig) -> dict[str, object]:
             "val": len(val_paths),
             "test": len(test_paths),
         },
+        "split_mode": config.split_mode,
+        "split_groups": split_groups,
     }
 
     config.metrics_output.parent.mkdir(parents=True, exist_ok=True)
@@ -378,6 +489,18 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--val-size", type=float, default=0.15)
     parser.add_argument("--test-size", type=float, default=0.15)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--split-mode",
+        choices=("group", "image"),
+        default="group",
+        help="Use 'group' to avoid sequence leakage; 'image' keeps the older random image split.",
+    )
+    parser.add_argument(
+        "--group-split-trials",
+        type=int,
+        default=5000,
+        help="Random candidate count for finding a balanced grouped split.",
+    )
     parser.add_argument(
         "--init-checkpoint",
         type=Path,

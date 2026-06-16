@@ -225,7 +225,11 @@ def evaluate_video(
             ):
                 face_crop = crop_bbox(frame, geometry_result.face_bbox, padding=0.08)
                 try:
-                    last_cnn_probability = predict_drowsiness_probability(cnn_model, face_crop)
+                    last_cnn_probability = predict_drowsiness_probability(
+                        cnn_model,
+                        face_crop,
+                        geometry_result=geometry_result,
+                    )
                 except Exception:
                     last_cnn_probability = None
 
